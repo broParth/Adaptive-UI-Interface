@@ -67,4 +67,4 @@ python main.py
 # 👥 Authors
 **Nishant Chakravarthy** - System Architecture & FSM Design
 
-**Parth** - UI Design & OS Integration
+**Parth Chourasia** - UI Design & OS Integration
