@@ -57,7 +57,7 @@ class EventCapture:
         self.key_count = 0
         self.move_distance = 0.0
         self.scroll_count = 0.0
-        self.last_event_time = time.time()
+        self.last_event_time = time.perf_counter()
         self.last_scroll_time = 0.0
         self.instant_click_detected = False
         self.instant_typing_detected = False
@@ -107,7 +107,7 @@ class EventCapture:
                         # Dead zone: ignore tiny jitter / sensor drift
                         if distance >= _MOVE_DEAD_ZONE:
                             self.move_distance += distance
-                            self.last_event_time = time.time()
+                            self.last_event_time = time.perf_counter()
 
                     # Always update position for next delta
                     self._last_x = x
@@ -132,8 +132,8 @@ class EventCapture:
         if scroll_amount > 0:
             with self.lock:
                 self.scroll_count += scroll_amount
-                self.last_event_time = time.time()
-                self.last_scroll_time = time.time()
+                self.last_event_time = time.perf_counter()
+                self.last_scroll_time = time.perf_counter()
                 self.instant_scroll_detected = True
             logger.debug("SCROLL DETECTED: dy=%s amount=%s", dy, scroll_amount)
 
@@ -143,13 +143,13 @@ class EventCapture:
             with self.lock:
                 self.click_count += 1
                 self.instant_click_detected = True
-                self.last_event_time = time.time()
+                self.last_event_time = time.perf_counter()
 
     def _on_key(self, key):
         """Keyboard press callback."""
         with self.lock:
             self.key_count += 1
-            self.last_event_time = time.time()
+            self.last_event_time = time.perf_counter()
 
             # Ignore modifier keys and special keys, allow letters, numbers, space, backspace, enter
             if hasattr(key, 'char') and key.char is not None:
@@ -160,7 +160,7 @@ class EventCapture:
                 is_valid = False
 
             if is_valid:
-                now = time.time()
+                now = time.perf_counter()
                 self.recent_keypress_times.append(now)
                 # Keep only keypresses from the last 0.3 seconds (~300ms)
                 self.recent_keypress_times = [t for t in self.recent_keypress_times if now - t <= 0.3]

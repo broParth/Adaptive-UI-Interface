@@ -74,6 +74,34 @@ STATE_THEMES = {
         "label": "⚠️ ERROR",
         "description": "Ambiguous input — Error Assistance Mode active",
     },
+    "BROWSING": {
+        "bg": "#0a1628",
+        "accent": "#00b4d8",
+        "accent_hover": "#0096c7",
+        "text": "#e0f2fe",
+        "panel_bg": "#0d2137",
+        "panel_border": "#00b4d8",
+        "header_bg": "#0d2137",
+        "state_color": "#00b4d8",
+        "state_glow": "#38bdf8",
+        "button_fg": "#000000",
+        "label": "🌐 BROWSING",
+        "description": "Normal Interaction — UI optimized for comfortable reading & navigation",
+    },
+    "ASSIST": {
+        "bg": "#241408",
+        "accent": "#f59e0b",
+        "accent_hover": "#d97706",
+        "text": "#fef3c7",
+        "panel_bg": "#2e1b0c",
+        "panel_border": "#f59e0b",
+        "header_bg": "#2e1b0c",
+        "state_color": "#f59e0b",
+        "state_glow": "#fbbf24",
+        "button_fg": "#000000",
+        "label": "🤝 ASSIST",
+        "description": "Interaction difficulty detected — assistance enabled",
+    },
     "PAUSED": {
         "bg": "#121212",
         "accent": "#9e9e9e",
@@ -89,6 +117,11 @@ STATE_THEMES = {
         "description": "Monitoring is temporarily suspended by user",
     },
 }
+
+# Aliases for backward compatibility
+STATE_THEMES["NORMAL"] = STATE_THEMES["BROWSING"]
+STATE_THEMES["ERROR"] = STATE_THEMES["ASSIST"]
+STATE_THEMES["ANOMALY"] = STATE_THEMES["ASSIST"]
 
 
 class AdaptiveUI:
@@ -639,16 +672,25 @@ class AdaptiveUI:
                     text_color="#5a5a6a",
                 )
 
-        elif state == "ERROR":
-            # Red-tinted inputs, hint labels
-            self.text_area.configure(border_color="#ff5252")
+        elif state in ("BROWSING", "NORMAL"):
+            self.workspace_header.configure(text="🌐 Interactive Workspace")
             for btn in self.buttons:
                 btn.configure(
                     fg_color=theme["accent"],
                     hover_color=theme["accent_hover"],
                     text_color=theme["button_fg"],
                 )
-            self.workspace_header.configure(text="⚠️ Error Assistance Mode")
+
+        elif state in ("ASSIST", "ERROR", "ANOMALY"):
+            # Amber/red-tinted inputs, hint labels
+            self.text_area.configure(border_color=theme["accent"])
+            for btn in self.buttons:
+                btn.configure(
+                    fg_color=theme["accent"],
+                    hover_color=theme["accent_hover"],
+                    text_color=theme["button_fg"],
+                )
+            self.workspace_header.configure(text=f"{theme['label']} Mode Active")
 
         elif state == "PAUSED":
             # Grey-tinted inputs, dim buttons, disabled look

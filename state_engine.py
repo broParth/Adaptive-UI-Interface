@@ -1,236 +1,262 @@
 """
 state_engine.py — Cognitive State Engine (FSM)
-Finite State Machine that classifies user behavior into 4 states.
-Maintains a transition log for the UI dashboard.
+Finite State Machine that classifies user behavior into 5 states:
+  - IDLE: No activity for 5.0+ seconds
+  - BROWSING: Normal active computer use (reading, casual mouse movement, occasional clicks, scrolling)
+  - FOCUS: Sustained concentrated interaction (typing with minimal pointer/scroll)
+  - ACTIVE: High-intensity bursts (rapid mouse translation, click bursts, fast scrolling)
+  - ASSIST: Specific interaction struggle / anomaly (e.g. rapid in-place rage clicking)
 
-Production Fixes:
-  - Moving averages for movement and scroll (3 cycle / 1.5s window)
-  - ACTIVE now triggers on cursor movement or scroll, not just clicks
-  - Scroll fast-path: scroll activity immediately triggers ACTIVE (no smoothing)
-  - FOCUS protected by scroll inactivity guard
-  - Thresholds are hardware-calibrated defaults (configurable)
+Production Enhancements:
+  - Time-based 1.0s sliding window smoothing (invariant to cycle intervals)
+  - History updated on EVERY path before evaluation (no stale history)
+  - ASSIST evaluated before generic click fast-paths
+  - Explicit numerical entry/exit hysteresis for ACTIVE and FOCUS
+  - Multi-state ASSIST exit (re-classifies to appropriate state, not blindly forced to BROWSING)
+  - Monotonic time (time.perf_counter) throughout
+  - Injectable `now` parameter for deterministic testing without time.sleep()
 """
 
 import time
 import logging
+from collections import deque
 
 logger = logging.getLogger("AdaptiveUI.FSM")
 
-# ─── Configurable Thresholds ──────────────────────────────────────────────────
-# NOTE: These thresholds are hardware-calibrated and may vary by
-# DPI, touchpad sensitivity, and screen resolution.
+# ─── Configurable Hysteresis Thresholds ───────────────────────────────────────
+# ACTIVE: High-intensity interaction
+ACTIVE_ENTRY_MOVE = 250.0      # px/s
+ACTIVE_ENTRY_CLICKS = 2.5      # clicks/s
+ACTIVE_ENTRY_SCROLLS = 1.5     # scrolls/s
 
-LOW_MOVE = 50           # Max movement/sec allowed in FOCUS (typing drift tolerance)
-MOVE_THRESHOLD = 200    # Min movement/sec to trigger ACTIVE
-SCROLL_THRESHOLD = 1    # Min scroll/sec to trigger ACTIVE (lowered from 5 for reliability)
+ACTIVE_EXIT_MOVE = 140.0       # px/s
+ACTIVE_EXIT_CLICKS = 1.0       # clicks/s
+ACTIVE_EXIT_SCROLLS = 0.5      # scrolls/s
+
+# FOCUS: Sustained concentrated typing
+FOCUS_ENTRY_KEYS = 2.0         # keys/s (~24+ WPM)
+FOCUS_ENTRY_MAX_MOVE = 40.0    # px/s (resting hand drift tolerance)
+FOCUS_ENTRY_MAX_SCROLL = 0.5   # scrolls/s
+
+FOCUS_EXIT_KEYS = 0.8          # keys/s (below ~9 WPM drops out)
+FOCUS_EXIT_BREAK_MOVE = 80.0   # px/s (deliberate pointer move breaks focus)
+FOCUS_EXIT_BREAK_SCROLL = 1.0  # scrolls/s (deliberate scroll breaks focus)
+
+# ASSIST: Specific interaction anomaly
+ASSIST_ENTRY_CLICKS = 4.0      # clicks/s
+ASSIST_ENTRY_MAX_MOVE = 30.0   # px/s (in-place clicking on frozen target)
+
+# IDLE: Absence of interaction
+IDLE_THRESHOLD = 5.0           # seconds
 
 
 class StateEngine:
     """
-    Behavior Classification FSM.
-    Determines user state based on input metrics.
-
-    States:
-        IDLE   — No activity for 5+ seconds
-        FOCUS  — Active typing with minimal mouse/scroll
-        ACTIVE — High click rate, cursor movement, or scrolling
-        ERROR  — Low/ambiguous activity (Error Assistance Mode)
+    Behavior Classification Finite State Machine.
+    Classifies user behavior based on sliding-window metrics.
     """
 
-    VALID_STATES = ("IDLE", "FOCUS", "ACTIVE", "ERROR")
+    VALID_STATES = ("IDLE", "BROWSING", "FOCUS", "ACTIVE", "ASSIST")
+    STATE_ALIASES = {
+        "NORMAL": "BROWSING",
+        "ERROR": "ASSIST",
+        "ANOMALY": "ASSIST",
+    }
 
-    def __init__(self):
+    def __init__(self, window_duration=1.0):
+        self.window_duration = window_duration
         self.current_state = "IDLE"
-        self.state_start_time = time.time()
+        self.state_start_time = time.perf_counter()
         self.log = []  # List of (timestamp_str, old_state, new_state, duration)
 
-        # FSM Smoothing — Moving Average Histories (3-cycle / 1.5s window)
-        self.click_history = []
-        self.key_history = []
-        self.move_history = []
-        self.scroll_history = []
+        # Sliding window history: stores (timestamp, clicks, keys, move_dist, scrolls, dt)
+        self._history = deque()
 
-        # Debouncing
-        self.candidate_state = "IDLE"
-        self.candidate_count = 0
+        # Hold times (monotonic timestamps)
         self.active_hold_until = 0.0
         self.focus_hold_until = 0.0
+        self.assist_hold_until = 0.0
 
-    def determine_state(self, metrics):
-        """
-        Classify user behavior based on metrics.
+    @classmethod
+    def normalize_state(cls, state):
+        """Map legacy or alternative state names to canonical names."""
+        return cls.STATE_ALIASES.get(state, state)
 
-        FSM Priority Order (interaction-aware):
-            0.  Instant Click  → ACTIVE (fast-path, bypasses smoothing)
-            0a. Scroll Activity → ACTIVE (fast-path, bypasses smoothing)
-            0b. Instant Typing  → FOCUS  (fast-path, bypasses smoothing)
-            1.  IDLE   — idle_time > 5s
-            2.  FOCUS  — keys/sec > 2, low movement, low scroll
-            3.  ACTIVE — clicks/sec > 3 OR movement > threshold OR scroll > threshold
-            4.  ERROR  — everything else (fallback, never reached during scrolling)
+    def _update_window_history(self, metrics, now):
         """
+        Record current cycle metrics and prune samples outside the time window.
+        Always executed first on every cycle to eliminate stale history bugs.
+        """
+        dt = metrics.get("elapsed_sec", 0.1)
+        if dt <= 0:
+            dt = 0.001
+
+        clicks = metrics.get("raw_clicks", metrics.get("clicks_per_sec", 0.0) * dt)
+        keys = metrics.get("raw_keys", metrics.get("keys_per_sec", 0.0) * dt)
+        move = metrics.get("raw_move", metrics.get("movement_per_sec", 0.0) * dt)
+        scrolls = metrics.get("raw_scrolls", metrics.get("scrolls_per_sec", 0.0) * dt)
+
+        self._history.append((now, clicks, keys, move, scrolls, dt))
+
+        # Prune samples older than the sliding window duration
+        cutoff = now - self.window_duration
+        while self._history and self._history[0][0] < cutoff:
+            self._history.popleft()
+
+    def _compute_window_rates(self):
+        """
+        Compute smoothed rate-per-second across the sliding time window.
+        Uses max(total_dt, window_duration) as effective baseline duration
+        to prevent single isolated events in a tiny slice from computing false high rates.
+        """
+        if not self._history:
+            return {
+                "clicks_per_sec": 0.0,
+                "keys_per_sec": 0.0,
+                "movement_per_sec": 0.0,
+                "scrolls_per_sec": 0.0,
+            }
+
+        total_clicks = sum(item[1] for item in self._history)
+        total_keys = sum(item[2] for item in self._history)
+        total_move = sum(item[3] for item in self._history)
+        total_scrolls = sum(item[4] for item in self._history)
+        total_dt = sum(item[5] for item in self._history)
+
+        effective_duration = max(total_dt, self.window_duration)
+
+        return {
+            "clicks_per_sec": total_clicks / effective_duration,
+            "keys_per_sec": total_keys / effective_duration,
+            "movement_per_sec": total_move / effective_duration,
+            "scrolls_per_sec": total_scrolls / effective_duration,
+        }
+
+    def _transition_to(self, target_state, now):
+        """Record transition log entry if state changes and update state metadata."""
+        target_state = self.normalize_state(target_state)
         prev = self.current_state
-        now = time.time()
 
-        idle_time = metrics["idle_time"]
-        raw_keys_per_sec = metrics["keys_per_sec"]
-        raw_clicks_per_sec = metrics["clicks_per_sec"]
-        raw_move_per_sec = metrics["movement_per_sec"]
-        raw_scroll_per_sec = metrics["scrolls_per_sec"]
-
-        # 0. Fast-path click response
-        if metrics.get("instant_click", False):
-            self.active_hold_until = now + 0.4  # Minimum 400ms hold
-            # Bypass smoothing and debouncing
-            self.candidate_state = "ACTIVE"
-            self.candidate_count = 2
-            
-            if prev != "ACTIVE":
-                duration = round(now - self.state_start_time, 1)
-                self.log.append((
-                    time.strftime("%H:%M:%S"),
-                    prev,
-                    "ACTIVE",
-                    duration
-                ))
-                self.current_state = "ACTIVE"
-                self.state_start_time = now
-                
-                if len(self.log) > 100:
-                    self.log = self.log[-100:]
-            return "ACTIVE"
-
-        # 0a. Fast-path scroll response (priority 2 — scroll is intentional user activity)
-        #     Bypasses moving averages, debounce delays, and candidate buffering.
-        if metrics.get("instant_scroll", False) or raw_scroll_per_sec > 0:
-            self.active_hold_until = now + 0.4  # Minimum 400ms hold
-            self.candidate_state = "ACTIVE"
-            self.candidate_count = 2
-
-            if prev != "ACTIVE":
-                duration = round(now - self.state_start_time, 1)
-                self.log.append((
-                    time.strftime("%H:%M:%S"),
-                    prev,
-                    "ACTIVE",
-                    duration
-                ))
-                self.current_state = "ACTIVE"
-                self.state_start_time = now
-
-                if len(self.log) > 100:
-                    self.log = self.log[-100:]
-
-            logger.debug("Scroll fast-path → ACTIVE (scroll/sec=%.1f)", raw_scroll_per_sec)
-            return "ACTIVE"
-
-        # 0b. Fast-path typing response (priority 3 — only if ACTIVE interrupt not active)
-        if metrics.get("instant_typing", False):
-            # Only trigger FOCUS if no active click interrupt and movement is low
-            if now >= self.active_hold_until and raw_move_per_sec < LOW_MOVE and raw_clicks_per_sec <= 0:
-                self.focus_hold_until = now + 0.6  # Minimum 600ms hold
-                self.candidate_state = "FOCUS"
-                self.candidate_count = 2
-
-                if prev != "FOCUS":
-                    duration = round(now - self.state_start_time, 1)
-                    self.log.append((
-                        time.strftime("%H:%M:%S"),
-                        prev,
-                        "FOCUS",
-                        duration
-                    ))
-                    self.current_state = "FOCUS"
-                    self.state_start_time = now
-
-                    if len(self.log) > 100:
-                        self.log = self.log[-100:]
-                return "FOCUS"
-
-        # 1. Moving Average Smoothing (3-cycle window = 1.5s)
-        self.click_history.append(raw_clicks_per_sec)
-        self.key_history.append(raw_keys_per_sec)
-        self.move_history.append(raw_move_per_sec)
-        self.scroll_history.append(raw_scroll_per_sec)
-
-        if len(self.click_history) > 3:
-            self.click_history.pop(0)
-        if len(self.key_history) > 3:
-            self.key_history.pop(0)
-        if len(self.move_history) > 3:
-            self.move_history.pop(0)
-        if len(self.scroll_history) > 3:
-            self.scroll_history.pop(0)
-
-        clicks_per_sec = sum(self.click_history) / len(self.click_history)
-        keys_per_sec = sum(self.key_history) / len(self.key_history)
-        movement_per_sec = sum(self.move_history) / len(self.move_history)
-        scrolls_per_sec = sum(self.scroll_history) / len(self.scroll_history)
-
-        # 2. Raw State Detection (interaction-aware)
-        if idle_time > 5:
-            new_state = "IDLE"
-        elif (
-            keys_per_sec > 2
-            and movement_per_sec < LOW_MOVE
-            and scrolls_per_sec < 2
-        ):
-            new_state = "FOCUS"
-        elif (
-            clicks_per_sec > 3
-            or movement_per_sec > MOVE_THRESHOLD
-            or scrolls_per_sec > SCROLL_THRESHOLD
-        ):
-            new_state = "ACTIVE"
-        else:
-            new_state = "ERROR"
-
-        # 3. Candidate State Debouncing Buffer
-        if new_state == self.candidate_state:
-            self.candidate_count += 1
-        else:
-            self.candidate_state = new_state
-            self.candidate_count = 1
-
-        # 4. Transition Logic
-        if self.candidate_count >= 2:
-            state = self.candidate_state
-        else:
-            state = self.current_state
-
-        # 5. Enforce Minimum ACTIVE Hold
-        if self.current_state == "ACTIVE" and now < self.active_hold_until:
-            state = "ACTIVE"
-            self.candidate_state = "ACTIVE"
-            self.candidate_count = 2
-
-        # 6. Enforce Minimum FOCUS Hold
-        if self.current_state == "FOCUS" and now < self.focus_hold_until:
-            state = "FOCUS"
-            self.candidate_state = "FOCUS"
-            self.candidate_count = 2
-
-        # Log transition only when state changes
-        if state != prev:
+        if target_state != prev:
             duration = round(now - self.state_start_time, 1)
             self.log.append((
                 time.strftime("%H:%M:%S"),
                 prev,
-                state,
-                duration
+                target_state,
+                duration,
             ))
-            self.current_state = state
+            self.current_state = target_state
             self.state_start_time = now
 
-            # Keep log bounded (last 100 entries)
             if len(self.log) > 100:
                 self.log = self.log[-100:]
 
-        return state
+            logger.info("State transition: %s -> %s (held %.1fs)", prev, target_state, duration)
 
-    def get_state_duration(self):
-        """How long the system has been in the current state."""
-        return round(time.time() - self.state_start_time, 1)
+        return self.current_state
+
+    def determine_state(self, metrics, now=None):
+        """
+        Classify user behavior into one of: IDLE, BROWSING, FOCUS, ACTIVE, ASSIST.
+
+        Args:
+            metrics: dict containing rates, raw counts, idle_time, and flags.
+            now: Monotonic timestamp (time.perf_counter), injectable for deterministic testing.
+
+        Returns:
+            str: The active FSM state.
+        """
+        if now is None:
+            now = time.perf_counter()
+
+        # ─── 1. Update rolling history first on every path ──────────────────
+        self._update_window_history(metrics, now)
+        smoothed = self._compute_window_rates()
+
+        idle_time = metrics.get("idle_time", 0.0)
+
+        # ─── 2. IDLE Check (Strict boundary: >= 5.0 seconds) ────────────────
+        if idle_time >= IDLE_THRESHOLD:
+            self._history.clear()
+            self.active_hold_until = 0.0
+            self.focus_hold_until = 0.0
+            self.assist_hold_until = 0.0
+            return self._transition_to("IDLE", now)
+
+        # ─── 3. ASSIST Anomaly Evaluation (Priority over ACTIVE bursts) ─────
+        # Specific anomaly: rage clicking (rapid clicking in place with no typing)
+        if (
+            smoothed["clicks_per_sec"] >= ASSIST_ENTRY_CLICKS
+            and smoothed["movement_per_sec"] < ASSIST_ENTRY_MAX_MOVE
+            and smoothed["keys_per_sec"] == 0.0
+        ):
+            self.assist_hold_until = now + 1.2
+            return self._transition_to("ASSIST", now)
+
+        # ─── 4. Hold-time guards ────────────────────────────────────────────
+        if self.current_state == "ASSIST":
+            if now < self.assist_hold_until:
+                return "ASSIST"
+            # Once assist_hold_until expires, fall through to re-classify into ACTIVE, FOCUS, or BROWSING
+
+        if self.current_state == "ACTIVE" and now < self.active_hold_until:
+            return "ACTIVE"
+
+        if self.current_state == "FOCUS" and now < self.focus_hold_until:
+            return "FOCUS"
+
+        # ─── 5. High-Intensity ACTIVE Evaluation (with Hysteresis) ──────────
+        if self.current_state == "ACTIVE":
+            # Exit condition: interaction settles below exit thresholds
+            if (
+                smoothed["movement_per_sec"] < ACTIVE_EXIT_MOVE
+                and smoothed["clicks_per_sec"] < ACTIVE_EXIT_CLICKS
+                and smoothed["scrolls_per_sec"] < ACTIVE_EXIT_SCROLLS
+            ):
+                # Dropped out of ACTIVE; continue evaluating FOCUS / BROWSING
+                pass
+            else:
+                return "ACTIVE"
+        else:
+            # Entry condition: high-intensity burst
+            if (
+                smoothed["movement_per_sec"] >= ACTIVE_ENTRY_MOVE
+                or smoothed["clicks_per_sec"] >= ACTIVE_ENTRY_CLICKS
+                or smoothed["scrolls_per_sec"] >= ACTIVE_ENTRY_SCROLLS
+            ):
+                self.active_hold_until = now + 0.5
+                return self._transition_to("ACTIVE", now)
+
+        # ─── 6. Sustained FOCUS Evaluation (with Hysteresis) ────────────────
+        if self.current_state == "FOCUS":
+            # Exit condition: typing stops or deliberate pointer/scroll movement occurs
+            if (
+                smoothed["keys_per_sec"] < FOCUS_EXIT_KEYS
+                or smoothed["movement_per_sec"] > FOCUS_EXIT_BREAK_MOVE
+                or smoothed["scrolls_per_sec"] >= FOCUS_EXIT_BREAK_SCROLL
+            ):
+                # Dropped out of FOCUS; continue evaluating BROWSING
+                pass
+            else:
+                return "FOCUS"
+        else:
+            # Entry condition: sustained typing with calm mouse/scroll
+            if (
+                smoothed["keys_per_sec"] >= FOCUS_ENTRY_KEYS
+                and smoothed["movement_per_sec"] <= FOCUS_ENTRY_MAX_MOVE
+                and smoothed["scrolls_per_sec"] < FOCUS_ENTRY_MAX_SCROLL
+            ):
+                self.focus_hold_until = now + 0.6
+                return self._transition_to("FOCUS", now)
+
+        # ─── 7. Default State: BROWSING ─────────────────────────────────────
+        # Ordinary computer use: reading, casual cursor movement, occasional clicks, normal scrolling
+        return self._transition_to("BROWSING", now)
+
+    def get_state_duration(self, now=None):
+        """How long the system has been in the current state in seconds."""
+        current_time = time.perf_counter() if now is None else now
+        return round(current_time - self.state_start_time, 1)
 
     def get_log(self, n=50):
         """Return last n transition entries."""

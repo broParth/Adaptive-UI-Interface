@@ -431,7 +431,11 @@ class OverlayController:
                 self.active_win.attributes("-alpha", 0.75)  # Appear immediately
             self._fade_to(self.active_win, 0.88, 0.10)
 
-        elif state == "ERROR":
+        elif state in ("BROWSING", "NORMAL"):
+            # Quiet overlay — normal browsing does not show an intrusive banner
+            pass
+
+        elif state in ("ASSIST", "ERROR", "ANOMALY"):
             bar_w, bar_h = 420, 40
             x = m.x + (m.width - bar_w) // 2
             y = m.y + 8

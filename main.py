@@ -16,6 +16,7 @@ Production Fixes:
 
 import logging
 import sys
+import time
 import customtkinter as ctk
 from event_capture import EventCapture
 from analyzer import compute_metrics
@@ -72,6 +73,7 @@ class AdaptiveEngine:
         self._prev_state = None
         self._shutting_down = False
         self.is_paused = False
+        self._last_cycle_time = time.perf_counter()
 
         logger.info("All subsystems initialized.")
 
@@ -85,7 +87,10 @@ class AdaptiveEngine:
         self.tray.start()
         logger.info("System tray icon started.")
 
-        # Start the 500ms update cycle
+        # Reset cycle timer right before entering update cycle
+        self._last_cycle_time = time.perf_counter()
+
+        # Start the update cycle (~75ms)
         self._update_cycle()
 
         # Handle window close → hide to tray (don't exit)
@@ -96,15 +101,19 @@ class AdaptiveEngine:
         self.root.mainloop()
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 100ms UPDATE CYCLE
+    # 75ms UPDATE CYCLE
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _update_cycle(self):
-        """Core processing loop — runs every 100ms."""
+        """Core processing loop — runs every ~75ms with true elapsed timing."""
         if self._shutting_down:
             return
 
         try:
+            now = time.perf_counter()
+            elapsed_sec = now - self._last_cycle_time
+            self._last_cycle_time = now
+
             # 1. Get raw event data (clears buffer even if paused)
             clicks, keys, move_dist, scrolls, last_time = self.capture.get_and_reset()
             instant_click = self.capture.consume_instant_click()
@@ -129,13 +138,14 @@ class AdaptiveEngine:
                 state_duration = 0.0
                 log_entries = self.engine.get_log()
             else:
-                # 2. Compute metrics
+                # 2. Compute metrics using true elapsed time
                 metrics = compute_metrics(clicks, keys, move_dist, scrolls, last_time,
-                                         instant_click, instant_typing, instant_scroll)
+                                         instant_click, instant_typing, instant_scroll,
+                                         elapsed_sec=elapsed_sec, now_perf=now)
 
                 # 3. Determine FSM state
-                state = self.engine.determine_state(metrics)
-                state_duration = self.engine.get_state_duration()
+                state = self.engine.determine_state(metrics, now=now)
+                state_duration = self.engine.get_state_duration(now=now)
                 log_entries = self.engine.get_log()
 
             # 4. Update tray icon state

@@ -159,9 +159,10 @@ def apply_system_effects(state, state_duration=0.0):
     elif state == "ACTIVE":
         set_brightness(100)
         notify("⚡ Active Mode", "UI optimized for rapid interaction")
-    elif state == "ERROR":
-        set_brightness(70)
-        notify("⚠️ Error Assistance", "Low confidence input — assistance enabled")
+    elif state in ("BROWSING", "NORMAL"):
+        pass  # Zero new hardware brightness behavior in Phase 1
+    elif state in ("ASSIST", "ERROR", "ANOMALY"):
+        notify("🤝 Interaction Assistance", "Interaction struggle detected — assistance enabled")
 
 
 def reset_brightness():
