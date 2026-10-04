@@ -1,11 +1,15 @@
 """
 state_engine.py — Cognitive State Engine (FSM)
 Finite State Machine that classifies user behavior into 5 states:
-  - IDLE: No activity for 5.0+ seconds
+  - IDLE: No activity for 10.0+ seconds
   - BROWSING: Normal active computer use (reading, casual mouse movement, occasional clicks, scrolling)
   - FOCUS: Sustained concentrated interaction (typing with minimal pointer/scroll)
   - ACTIVE: High-intensity bursts (rapid mouse translation, click bursts, fast scrolling)
   - ASSIST: Specific interaction struggle / anomaly (e.g. rapid in-place rage clicking)
+
+Phase 1.5 update:
+  - IDLE_THRESHOLD increased from 5.0s to 10.0s to accommodate natural pauses
+    during reading, thinking, code review, and media consumption.
 
 Production Enhancements:
   - Time-based 1.0s sliding window smoothing (invariant to cycle intervals)
@@ -47,7 +51,9 @@ ASSIST_ENTRY_CLICKS = 4.0      # clicks/s
 ASSIST_ENTRY_MAX_MOVE = 30.0   # px/s (in-place clicking on frozen target)
 
 # IDLE: Absence of interaction
-IDLE_THRESHOLD = 5.0           # seconds
+# 10.0s gives a real desktop user enough grace for reading, thinking, watching,
+# or reviewing code without triggering the IDLE dim/pause prematurely.
+IDLE_THRESHOLD = 10.0           # seconds
 
 
 class StateEngine:

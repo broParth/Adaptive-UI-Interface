@@ -1,2 +1,3 @@
 __pycache__/
 *.pyc
+brightness_state.json

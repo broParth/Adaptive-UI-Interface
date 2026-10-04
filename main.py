@@ -24,7 +24,7 @@ from state_engine import StateEngine
 from ui_controller import AdaptiveUI
 from overlay_manager import OverlayController
 from tray_icon import TrayIcon
-from system_bridge import apply_system_effects, reset_brightness
+from system_bridge import apply_system_effects, restore_original_brightness, invalidate_brightness_state
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -182,9 +182,13 @@ class AdaptiveEngine:
         self.tray.set_paused(self.is_paused)
         if self.is_paused:
             logger.info("Monitoring paused by user.")
-            reset_brightness()  # Restore brightness while paused
+            restore_original_brightness()  # Relinquish brightness control while paused
         else:
             logger.info("Monitoring resumed by user.")
+            # Invalidate the cached previous state so the very next update cycle
+            # unconditionally re-applies the current FSM state's brightness target,
+            # even if the state name did not change during the pause.
+            invalidate_brightness_state()
             
     def _toggle_dashboard(self):
         """Toggle dashboard visibility (called from tray)."""
@@ -232,7 +236,7 @@ class AdaptiveEngine:
         logger.info("Shutting down Adaptive UI Engine...")
 
         try:
-            reset_brightness()
+            restore_original_brightness()
             from system_bridge import restore_mouse_speed
             restore_mouse_speed()
         except Exception:
